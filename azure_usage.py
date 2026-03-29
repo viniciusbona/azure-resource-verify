@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Azure Inventory Script - Versão Completa com Classificação Corrigida para Public IPs
+Azure Inventory Script - Versão Completa com Suporte a TODOS os tipos de recursos
+Inclui métricas para: VMs, Discos, IPs, NICs, NSGs, VNets, Storage, SQL, Key Vault,
+App Services, Service Bus, Cosmos DB, AKS, Load Balancers, Logic Apps, API Management, etc.
 """
 
 import os
@@ -10,8 +12,9 @@ import pandas as pd
 import subprocess
 import time
 import re
+import argparse
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.resourcegraph import ResourceGraphClient
@@ -20,14 +23,64 @@ from azure.mgmt.resourcegraph.models import QueryRequest, QueryRequestOptions
 # ===== CONFIGURAÇÃO =====
 DAYS = 30
 OUT_DIR = "output"
-SUBSCRIPTION_IDS = ["SDSSFAFSAFSDAS"]
-SUBSCRIPTION_NAME = "sample"
-REGION = "Brazil South"
+REGION = "Multiple"
 DELAY_BETWEEN_REQUESTS = 2
 ENABLE_METRICS = True
 MAX_RETRIES = 3
 
 os.makedirs(OUT_DIR, exist_ok=True)
+
+# ===== FUNÇÃO PARA OBTER NOMES DAS SUBSCRIPTIONS =====
+def get_subscription_names(subscription_ids):
+    """Obtém os nomes das subscriptions usando Azure CLI"""
+    subscription_names = {}
+    
+    try:
+        # Tentar obter via Azure CLI
+        cmd = ["az", "account", "list", "--output", "json"]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        
+        if result.returncode == 0:
+            accounts = json.loads(result.stdout)
+            for account in accounts:
+                sub_id = account.get('id', '')
+                sub_name = account.get('name', '')
+                if sub_id in subscription_ids:
+                    subscription_names[sub_id] = sub_name
+    except Exception as e:
+        print(f"⚠️ Erro ao obter nomes das subscriptions via CLI: {e}")
+    
+    # Para subscriptions não encontradas, usar o ID truncado
+    for sub_id in subscription_ids:
+        if sub_id not in subscription_names:
+            subscription_names[sub_id] = sub_id[:8]
+    
+    return subscription_names
+
+# ===== FUNÇÃO PARA VALIDAR SUBSCRIPTION IDS =====
+def validate_subscription_ids(subscription_ids):
+    """Valida se os subscription IDs são válidos e acessíveis"""
+    valid_ids = []
+    invalid_ids = []
+    
+    for sub_id in subscription_ids:
+        try:
+            cmd = ["az", "account", "show", "--subscription", sub_id, "--output", "json"]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode == 0:
+                valid_ids.append(sub_id)
+            else:
+                invalid_ids.append(sub_id)
+        except Exception:
+            invalid_ids.append(sub_id)
+    
+    if invalid_ids:
+        print(f"\n⚠️ ATENÇÃO: As seguintes subscriptions são inválidas ou inacessíveis:")
+        for inv_id in invalid_ids:
+            print(f"   - {inv_id}")
+    
+    return valid_ids, invalid_ids
 
 # ===== INICIALIZAÇÃO =====
 print("🔧 Inicializando...")
@@ -57,7 +110,7 @@ def get_metrics_with_retry(resource_id: str, metric_name: str, aggregation: str,
             if attempt < max_retries - 1:
                 wait_time = DELAY_BETWEEN_REQUESTS * (2 ** attempt)
                 time.sleep(wait_time)
-        except Exception as e:
+        except Exception:
             if attempt < max_retries - 1:
                 time.sleep(DELAY_BETWEEN_REQUESTS * (2 ** attempt))
     return None
@@ -98,85 +151,21 @@ def get_metrics_via_cli(resource_id: str, metric_name: str, aggregation: str, da
     except Exception:
         return None
 
-# ===== FUNÇÃO PARA DESCOBRIR TIPOS DE RECURSO COM SKU =====
-def discover_sku_types(df: pd.DataFrame) -> List[str]:
-    """Descobre dinamicamente quais tipos de recurso têm SKU"""
-    sku_types = []
-    unique_types = df['resourceType'].unique()
-    
-    print("\n🔍 Descobrindo tipos de recurso com SKU...")
-    
-    skip_types = [
-        'microsoft.compute/restorepointcollections',
-        'microsoft.operationalinsights/workspaces',
-        'microsoft.network/networkinterfaces',
-        'microsoft.network/networksecuritygroups',
-        'microsoft.network/virtualnetworks',
-        'microsoft.network/networkwatchers',
-        'microsoft.network/routetables',
-        'microsoft.compute/virtualmachines/extensions'
-    ]
-    
-    for resource_type in unique_types:
-        if resource_type in skip_types:
-            continue
-        
-        sample = df[df['resourceType'] == resource_type]
-        if sample.empty:
-            continue
-        sample = sample.iloc[0]
-        
-        try:
-            if resource_type == 'microsoft.compute/virtualmachines':
-                cmd = ["az", "vm", "show", "--ids", sample['id'], "--query", "hardwareProfile.vmSize", "--output", "tsv"]
-            elif resource_type == 'microsoft.compute/disks':
-                cmd = ["az", "disk", "show", "--ids", sample['id'], "--query", "sku.name", "--output", "tsv"]
-            elif resource_type == 'microsoft.storage/storageaccounts':
-                cmd = ["az", "storage", "account", "show", "--ids", sample['id'], "--query", "sku.name", "--output", "tsv"]
-            elif resource_type == 'microsoft.network/publicipaddresses':
-                cmd = ["az", "network", "public-ip", "show", "--ids", sample['id'], "--query", "sku.name", "--output", "tsv"]
-            elif resource_type == 'microsoft.recoveryservices/vaults':
-                cmd = ["az", "backup", "vault", "show", "--ids", sample['id'], "--query", "sku.name", "--output", "tsv"]
-            else:
-                cmd = ["az", "resource", "show", "--ids", sample['id'], "--query", "sku.name", "--output", "tsv"]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-            if result.returncode == 0 and result.stdout.strip():
-                sku_types.append(resource_type)
-                print(f"  ✅ {resource_type.split('/')[-1]} - tem SKU")
-            else:
-                print(f"  ⚠️ {resource_type.split('/')[-1]} - sem SKU")
-        except Exception as e:
-            print(f"  ⚠️ {resource_type.split('/')[-1]} - erro")
-    
-    return sku_types
+# ===== FUNÇÃO PARA FORMATAR NÚMEROS GRANDES =====
+def format_number(value: float) -> str:
+    """Formata números grandes com K, M, B"""
+    if value >= 1_000_000_000:
+        return f"{value/1_000_000_000:.1f}B"
+    elif value >= 1_000_000:
+        return f"{value/1_000_000:.1f}M"
+    elif value >= 1_000:
+        return f"{value/1_000:.1f}K"
+    return f"{value:,.0f}"
 
-# ===== FUNÇÃO PARA OBTER SKU DINAMICAMENTE =====
-def get_resource_sku_dynamic(resource_id: str, resource_type: str) -> str:
-    """Obtém SKU do recurso de forma dinâmica"""
-    try:
-        if resource_type == 'microsoft.compute/virtualmachines':
-            cmd = ["az", "vm", "show", "--ids", resource_id, "--query", "hardwareProfile.vmSize", "--output", "tsv"]
-        elif resource_type == 'microsoft.compute/disks':
-            cmd = ["az", "disk", "show", "--ids", resource_id, "--query", "sku.name", "--output", "tsv"]
-        elif resource_type == 'microsoft.storage/storageaccounts':
-            cmd = ["az", "storage", "account", "show", "--ids", resource_id, "--query", "sku.name", "--output", "tsv"]
-        elif resource_type == 'microsoft.network/publicipaddresses':
-            cmd = ["az", "network", "public-ip", "show", "--ids", resource_id, "--query", "sku.name", "--output", "tsv"]
-        elif resource_type == 'microsoft.recoveryservices/vaults':
-            cmd = ["az", "backup", "vault", "show", "--ids", resource_id, "--query", "sku.name", "--output", "tsv"]
-        else:
-            cmd = ["az", "resource", "show", "--ids", resource_id, "--query", "sku.name", "--output", "tsv"]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except Exception:
-        pass
-    return ""
+# ===== FUNÇÕES DE MÉTRICAS POR TIPO DE RECURSO =====
 
-# ===== FUNÇÃO PARA OBTER MÉTRICAS DE VM =====
-def get_vm_metrics_summary(resource_id: str, vm_sku: str = "") -> str:
+def get_vm_metrics_summary(resource_id: str) -> str:
+    """Retorna resumo das métricas da VM"""
     summary_parts = []
     cpu_avg = get_metrics_with_retry(resource_id, "Percentage CPU", "Average", DAYS)
     if cpu_avg is not None and cpu_avg > 0:
@@ -192,30 +181,22 @@ def get_vm_metrics_summary(resource_id: str, vm_sku: str = "") -> str:
                 summary_parts.append(f"Rede: {total_mb:.1f} MB")
     return "; ".join(summary_parts) if summary_parts else "Sem métricas"
 
-# ===== FUNÇÃO PARA OBTER MÉTRICAS DE IP PÚBLICO =====
 def get_public_ip_metrics_summary(resource_id: str) -> str:
+    """Retorna resumo das métricas do Public IP usando Packet Count"""
     packet_count = get_metrics_with_retry(resource_id, "PacketCount", "Total", DAYS)
     if packet_count is not None and packet_count > 0:
-        if packet_count >= 1000000:
-            return f"{packet_count/1000000:.1f}M pacotes"
-        elif packet_count >= 1000:
-            return f"{packet_count/1000:.1f}K pacotes"
-        return f"{packet_count:,.0f} pacotes"
+        return f"{format_number(packet_count)} pacotes"
     return "0 pacotes"
 
-# ===== FUNÇÃO PARA OBTER MÉTRICAS DE STORAGE =====
 def get_storage_metrics_summary(resource_id: str) -> str:
+    """Retorna resumo das métricas do Storage Account"""
     transactions = get_metrics_with_retry(resource_id, "Transactions", "Total", DAYS)
     if transactions is not None and transactions > 0:
-        if transactions >= 1000000:
-            return f"Transações: {transactions/1000000:.1f}M"
-        elif transactions >= 1000:
-            return f"Transações: {transactions/1000:.1f}K"
-        return f"Transações: {transactions:,.0f}"
+        return f"Transações: {format_number(transactions)}"
     return "Sem transações"
 
-# ===== FUNÇÃO PARA OBTER MÉTRICAS DE DISCO =====
 def get_disk_metrics_summary(resource_id: str) -> str:
+    """Retorna resumo das métricas do Disco"""
     read_ops = get_metrics_with_retry(resource_id, "Composite Disk Read Operations/sec", "Average", DAYS)
     write_ops = get_metrics_with_retry(resource_id, "Composite Disk Write Operations/sec", "Average", DAYS)
     summary_parts = []
@@ -231,8 +212,8 @@ def get_disk_metrics_summary(resource_id: str) -> str:
             summary_parts.append(f"Escrita: {write_ops:.1f} ops/s")
     return "; ".join(summary_parts) if summary_parts else "Sem métricas"
 
-# ===== FUNÇÃO PARA OBTER MÉTRICAS DE NIC =====
 def get_nic_metrics_summary(resource_id: str) -> str:
+    """Retorna resumo das métricas da Interface de Rede"""
     summary_parts = []
     bytes_received = get_metrics_with_retry(resource_id, "Bytes Received", "Total", DAYS)
     if bytes_received is not None and bytes_received > 0:
@@ -250,19 +231,15 @@ def get_nic_metrics_summary(resource_id: str) -> str:
             summary_parts.append(f"Tx: {mb_sent:.1f} MB")
     return "; ".join(summary_parts) if summary_parts else "Sem tráfego"
 
-# ===== FUNÇÃO PARA OBTER MÉTRICAS DE NSG =====
 def get_nsg_metrics_summary(resource_id: str) -> str:
+    """Retorna resumo das métricas do NSG"""
     rules_hit = get_metrics_with_retry(resource_id, "AllRuleHits", "Total", DAYS)
     if rules_hit is not None and rules_hit > 0:
-        if rules_hit >= 1000000:
-            return f"{rules_hit/1000000:.1f}M regras acionadas"
-        elif rules_hit >= 1000:
-            return f"{rules_hit/1000:.1f}K regras acionadas"
-        return f"{rules_hit:,.0f} regras acionadas"
+        return f"{format_number(rules_hit)} regras acionadas"
     return "Sem regras acionadas"
 
-# ===== FUNÇÃO PARA OBTER MÉTRICAS DE VNET =====
 def get_vnet_usage_summary(resource_id: str, df: pd.DataFrame) -> str:
+    """Verifica uso da VNet baseado em dispositivos anexados"""
     summary_parts = []
     vnet_name = resource_id.split('/')[-1]
     
@@ -273,48 +250,140 @@ def get_vnet_usage_summary(resource_id: str, df: pd.DataFrame) -> str:
     if not associated_nics.empty:
         summary_parts.append(f"{len(associated_nics)} NIC(s) conectada(s)")
     
-    gateways = df[
-        (df['resourceType'].str.contains('gateway', na=False)) &
-        (df['dependencies'].str.contains(vnet_name, na=False))
-    ]
-    if not gateways.empty:
-        summary_parts.append(f"{len(gateways)} gateway(s) conectado(s)")
-    
-    private_endpoints = df[
-        (df['resourceType'] == 'microsoft.network/privateendpoints') &
-        (df['dependencies'].str.contains(vnet_name, na=False))
-    ]
-    if not private_endpoints.empty:
-        summary_parts.append(f"{len(private_endpoints)} private endpoint(s)")
-    
     if summary_parts:
         return "; ".join(summary_parts)
     return "Sem recursos anexados (VNet vazia)"
 
-# ===== FUNÇÃO PARA OBTER MÉTRICAS DE BACKUP =====
 def get_backup_metrics_summary(resource_id: str) -> str:
+    """Retorna resumo das métricas da Backup Collection"""
     restore_points = get_metrics_with_retry(resource_id, "Restore Point Count", "Total", DAYS)
     if restore_points is not None and restore_points > 0:
         return f"{restore_points:,.0f} pontos de restauração"
     return "Sem pontos de restauração"
 
-# ===== FUNÇÃO PARA OBTER MÉTRICAS DE VAULT =====
 def get_vault_metrics_summary(resource_id: str) -> str:
+    """Retorna resumo das métricas do Recovery Vault"""
     backup_items = get_metrics_with_retry(resource_id, "Backup Items", "Average", DAYS)
     if backup_items is not None and backup_items > 0:
         return f"{backup_items:.0f} itens em backup"
     return "Sem itens em backup"
 
-# ===== FUNÇÃO PARA OBTER MÉTRICAS DE LOG ANALYTICS =====
 def get_log_analytics_metrics_summary(resource_id: str) -> str:
+    """Retorna resumo das métricas do Log Analytics"""
     ingested_data = get_metrics_with_retry(resource_id, "Data Ingestion", "Total", DAYS)
     if ingested_data is not None and ingested_data > 0:
         gb_ingested = ingested_data / (1024 * 1024 * 1024)
         return f"{gb_ingested:.1f} GB ingeridos"
     return "Sem dados ingeridos"
 
+def get_app_service_metrics_summary(resource_id: str) -> str:
+    """Retorna resumo das métricas do App Service / Function App"""
+    summary_parts = []
+    requests = get_metrics_with_retry(resource_id, "Requests", "Total", DAYS)
+    if requests is not None and requests > 0:
+        summary_parts.append(f"Requisições: {format_number(requests)}")
+    cpu = get_metrics_with_retry(resource_id, "CpuPercentage", "Average", DAYS)
+    if cpu is not None and cpu > 0:
+        summary_parts.append(f"CPU: {cpu:.1f}%")
+    memory = get_metrics_with_retry(resource_id, "MemoryWorkingSet", "Average", DAYS)
+    if memory is not None and memory > 0:
+        memory_gb = memory / (1024 * 1024 * 1024)
+        summary_parts.append(f"Memória: {memory_gb:.1f} GB")
+    return "; ".join(summary_parts) if summary_parts else "Sem métricas"
+
+def get_sql_db_metrics_summary(resource_id: str) -> str:
+    """Retorna resumo das métricas do SQL Database"""
+    summary_parts = []
+    dtu = get_metrics_with_retry(resource_id, "dtu_consumption_percent", "Average", DAYS)
+    if dtu is not None and dtu > 0:
+        summary_parts.append(f"DTU: {dtu:.1f}%")
+    cpu = get_metrics_with_retry(resource_id, "cpu_percent", "Average", DAYS)
+    if cpu is not None and cpu > 0:
+        summary_parts.append(f"CPU: {cpu:.1f}%")
+    storage = get_metrics_with_retry(resource_id, "storage_percent", "Average", DAYS)
+    if storage is not None and storage > 0:
+        summary_parts.append(f"Storage: {storage:.1f}%")
+    return "; ".join(summary_parts) if summary_parts else "Sem métricas"
+
+def get_keyvault_metrics_summary(resource_id: str) -> str:
+    """Retorna resumo das métricas do Key Vault"""
+    summary_parts = []
+    requests = get_metrics_with_retry(resource_id, "ServiceApiHit", "Total", DAYS)
+    if requests is not None and requests > 0:
+        summary_parts.append(f"Requisições: {format_number(requests)}")
+    latency = get_metrics_with_retry(resource_id, "ServiceApiLatency", "Average", DAYS)
+    if latency is not None and latency > 0:
+        summary_parts.append(f"Latência: {latency:.0f}ms")
+    return "; ".join(summary_parts) if summary_parts else "Sem métricas"
+
+def get_servicebus_metrics_summary(resource_id: str) -> str:
+    """Retorna resumo das métricas do Service Bus"""
+    summary_parts = []
+    incoming = get_metrics_with_retry(resource_id, "IncomingMessages", "Total", DAYS)
+    if incoming is not None and incoming > 0:
+        summary_parts.append(f"Msg recebidas: {format_number(incoming)}")
+    outgoing = get_metrics_with_retry(resource_id, "OutgoingMessages", "Total", DAYS)
+    if outgoing is not None and outgoing > 0:
+        summary_parts.append(f"Msg enviadas: {format_number(outgoing)}")
+    return "; ".join(summary_parts) if summary_parts else "Sem métricas"
+
+def get_cosmosdb_metrics_summary(resource_id: str) -> str:
+    """Retorna resumo das métricas do Cosmos DB"""
+    summary_parts = []
+    requests = get_metrics_with_retry(resource_id, "TotalRequests", "Total", DAYS)
+    if requests is not None and requests > 0:
+        summary_parts.append(f"Requisições: {format_number(requests)}")
+    ru = get_metrics_with_retry(resource_id, "TotalRequestUnits", "Total", DAYS)
+    if ru is not None and ru > 0:
+        summary_parts.append(f"RU: {format_number(ru)}")
+    storage = get_metrics_with_retry(resource_id, "DataUsage", "Average", DAYS)
+    if storage is not None and storage > 0:
+        storage_gb = storage / (1024 * 1024 * 1024)
+        summary_parts.append(f"Storage: {storage_gb:.1f} GB")
+    return "; ".join(summary_parts) if summary_parts else "Sem métricas"
+
+def get_loadbalancer_metrics_summary(resource_id: str) -> str:
+    """Retorna resumo das métricas do Load Balancer"""
+    summary_parts = []
+    bytes_processed = get_metrics_with_retry(resource_id, "ByteCount", "Total", DAYS)
+    if bytes_processed is not None and bytes_processed > 0:
+        gb_processed = bytes_processed / (1024 * 1024 * 1024)
+        summary_parts.append(f"Dados: {gb_processed:.1f} GB")
+    return "; ".join(summary_parts) if summary_parts else "Sem métricas"
+
+def get_logicapp_metrics_summary(resource_id: str) -> str:
+    """Retorna resumo das métricas do Logic App"""
+    summary_parts = []
+    runs = get_metrics_with_retry(resource_id, "RunsStarted", "Total", DAYS)
+    if runs is not None and runs > 0:
+        summary_parts.append(f"Execuções: {format_number(runs)}")
+    failed = get_metrics_with_retry(resource_id, "RunsFailed", "Total", DAYS)
+    if failed is not None and failed > 0:
+        summary_parts.append(f"Falhas: {format_number(failed)}")
+    return "; ".join(summary_parts) if summary_parts else "Sem métricas"
+
+def get_apim_metrics_summary(resource_id: str) -> str:
+    """Retorna resumo das métricas do API Management"""
+    summary_parts = []
+    requests = get_metrics_with_retry(resource_id, "Requests", "Total", DAYS)
+    if requests is not None and requests > 0:
+        summary_parts.append(f"Requisições: {format_number(requests)}")
+    duration = get_metrics_with_retry(resource_id, "Duration", "Average", DAYS)
+    if duration is not None and duration > 0:
+        summary_parts.append(f"Duração: {duration:.0f}ms")
+    return "; ".join(summary_parts) if summary_parts else "Sem métricas"
+
+def get_aks_metrics_summary(resource_id: str) -> str:
+    """Retorna resumo das métricas do AKS Cluster"""
+    summary_parts = []
+    nodes = get_metrics_with_retry(resource_id, "nodesCount", "Average", DAYS)
+    if nodes is not None and nodes > 0:
+        summary_parts.append(f"Nós: {nodes:.0f}")
+    return "; ".join(summary_parts) if summary_parts else "Sem métricas"
+
 # ===== FUNÇÃO PARA BUSCAR TODOS OS RECURSOS =====
-def get_all_resources(subscription_ids):
+def get_all_resources(subscription_ids, subscription_names):
+    """Busca TODOS os recursos via Resource Graph"""
     all_resources = []
     query = """
     resources
@@ -328,7 +397,9 @@ def get_all_resources(subscription_ids):
         tags
     """
     for sub_id in subscription_ids:
-        print(f"\n📡 Buscando recursos na subscription: {sub_id[:8]}...")
+        sub_name = subscription_names.get(sub_id, sub_id[:8])
+        print(f"\n📡 Buscando recursos na subscription: {sub_name} ({sub_id[:8]}...)")
+        
         request = QueryRequest(
             query=query,
             subscriptions=[sub_id],
@@ -352,11 +423,56 @@ def get_all_resources(subscription_ids):
             print(f"  ❌ Erro: {e}")
     return pd.DataFrame(all_resources)
 
+# ===== FUNÇÃO PARA CLASSIFICAR RECURSOS =====
+def classify_resource(resource_type: str) -> Tuple[str, str]:
+    """Classifica o recurso por categoria"""
+    type_lower = resource_type.lower()
+    
+    type_map = {
+        'virtualmachines': ("Computação - VM", "Virtual Machine"),
+        'disks': ("Armazenamento - Disco", "Managed Disk"),
+        'publicipaddresses': ("Rede - IP Público", "Public IP"),
+        'networkinterfaces': ("Rede - Interface", "Network Interface"),
+        'networksecuritygroups': ("Rede - Segurança", "NSG"),
+        'virtualnetworks': ("Rede - Virtual", "VNet"),
+        'storageaccounts': ("Armazenamento - Storage", "Storage Account"),
+        'recoveryservices': ("Backup - Recovery Vault", "Backup Vault"),
+        'restorepointcollections': ("Backup - Pontos Restauração", "Backup Collection"),
+        'operationalinsights': ("Monitoramento - Log Analytics", "Log Analytics"),
+        'networkwatchers': ("Monitoramento - Network Watcher", "Network Watcher"),
+        'routetables': ("Rede - Tabela de Rotas", "Route Table"),
+        'loadbalancers': ("Rede - Load Balancer", "Load Balancer"),
+        'virtualnetworkgateways': ("Rede - VPN Gateway", "VPN Gateway"),
+        'bastionhosts': ("Rede - Bastion", "Bastion"),
+        'privateendpoints': ("Rede - Private Endpoint", "Private Endpoint"),
+        'sql/servers/databases': ("Banco de Dados - SQL", "SQL Database"),
+        'keyvault': ("Segurança - Key Vault", "Key Vault"),
+        'sites': ("Aplicação - App Service", "App Service"),
+        'serverfarms': ("Aplicação - App Service Plan", "App Service Plan"),
+        'logic': ("Integração - Logic App", "Logic App"),
+        'servicebus': ("Integração - Service Bus", "Service Bus"),
+        'documentdb': ("Banco de Dados - Cosmos DB", "Cosmos DB"),
+        'containerservice': ("Contêiner - Kubernetes", "AKS"),
+        'containerregistry': ("Contêiner - Container Registry", "Container Registry"),
+        'databricks': ("Análise - Databricks", "Databricks"),
+        'powerbidedicated': ("BI - Power BI Embedded", "Power BI"),
+        'automation': ("Automação - Automation Account", "Automation"),
+        'apimanagement': ("Integração - API Management", "API Management"),
+        'dnszones': ("Rede - DNS Zone", "DNS Zone"),
+    }
+    
+    for key, value in type_map.items():
+        if key in type_lower:
+            return value
+    return "Outros", resource_type.split('/')[-1]
+
 # ===== FUNÇÃO PARA IDENTIFICAR DEPENDÊNCIAS =====
 def identify_dependencies(df: pd.DataFrame) -> pd.DataFrame:
+    """Identifica dependências entre recursos"""
     df['dependencies'] = ""
     df['attached_resources'] = ""
     df['parent_resource'] = ""
+    
     for idx, row in df.iterrows():
         resource_type = row['resourceType']
         resource_name = row['resourceName'].lower()
@@ -415,8 +531,37 @@ def identify_dependencies(df: pd.DataFrame) -> pd.DataFrame:
             df.at[idx, 'parent_resource'] = parent
     return df
 
+# ===== FUNÇÃO PARA OBTER SKU DINAMICAMENTE =====
+def get_resource_sku_dynamic(resource_id: str, resource_type: str) -> str:
+    """Obtém SKU do recurso de forma dinâmica"""
+    try:
+        if resource_type == 'microsoft.compute/virtualmachines':
+            cmd = ["az", "vm", "show", "--ids", resource_id, "--query", "hardwareProfile.vmSize", "--output", "tsv"]
+        elif resource_type == 'microsoft.compute/disks':
+            cmd = ["az", "disk", "show", "--ids", resource_id, "--query", "sku.name", "--output", "tsv"]
+        elif resource_type == 'microsoft.storage/storageaccounts':
+            cmd = ["az", "storage", "account", "show", "--ids", resource_id, "--query", "sku.name", "--output", "tsv"]
+        elif resource_type == 'microsoft.network/publicipaddresses':
+            cmd = ["az", "network", "public-ip", "show", "--ids", resource_id, "--query", "sku.name", "--output", "tsv"]
+        elif resource_type == 'microsoft.recoveryservices/vaults':
+            cmd = ["az", "backup", "vault", "show", "--ids", resource_id, "--query", "sku.name", "--output", "tsv"]
+        elif resource_type == 'microsoft.web/serverfarms':
+            cmd = ["az", "appservice", "plan", "show", "--ids", resource_id, "--query", "sku.name", "--output", "tsv"]
+        elif resource_type == 'microsoft.containerservice/managedclusters':
+            cmd = ["az", "aks", "show", "--ids", resource_id, "--query", "sku.tier", "--output", "tsv"]
+        else:
+            cmd = ["az", "resource", "show", "--ids", resource_id, "--query", "sku.name", "--output", "tsv"]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return ""
+
 # ===== FUNÇÃO PARA OBTER CUSTO =====
 def get_cost_for_resource(subscription_id, resource_id, resource_name, resource_type):
+    """Obtém custo para um recurso"""
     url = f"https://management.azure.com/subscriptions/{subscription_id}/providers/Microsoft.CostManagement/query?api-version=2021-10-01"
     start_str = start.strftime("%Y-%m-%d")
     end_str = end.strftime("%Y-%m-%d")
@@ -444,143 +589,47 @@ def get_cost_for_resource(subscription_id, resource_id, resource_name, resource_
     except Exception:
         return None
 
-# ===== FUNÇÃO PARA ANALISAR RECURSO =====
-def analyze_resource(resource_name: str, resource_type: str, cost: float, dependencies: str, usage_summary: str = "", sku: str = "") -> Dict:
-    """Analisa recurso e retorna classificações"""
-    
-    if resource_type == 'microsoft.network/publicipaddresses':
-        # Verificar se tem tráfego (pacotes)
-        has_traffic = False
-        if usage_summary and "pacotes" in usage_summary:
-            try:
-                if 'M' in usage_summary:
-                    match = re.search(r'([\d.]+)M', usage_summary)
-                    if match:
-                        packet_count = float(match.group(1)) * 1000000
-                        has_traffic = packet_count > 0
-                elif 'K' in usage_summary:
-                    match = re.search(r'([\d.]+)K', usage_summary)
-                    if match:
-                        packet_count = float(match.group(1)) * 1000
-                        has_traffic = packet_count > 0
-                else:
-                    match = re.search(r'([\d,]+)', usage_summary)
-                    if match:
-                        packet_count = int(match.group(1).replace(',', ''))
-                        has_traffic = packet_count > 0
-            except:
-                has_traffic = usage_summary != "0 pacotes"
-        
-        # Classificação baseada em uso real
-        in_use = "Sim" if has_traffic else "Não"
-        classification = "Rede - IP Público"
-        purpose = "Public IP"
-        
-        # Determinar ação com base no tráfego e custo
-        if not has_traffic:
-            # IP sem tráfego
-            if cost > 0:
-                removal_impact = "Baixo"
-                recommendation = f"PODE REMOVER - IP sem tráfego (custo R$ {cost:.2f})"
-                orphan_candidate = "Sim"
-            else:
-                removal_impact = "Muito Baixo"
-                recommendation = "PODE REMOVER - IP sem tráfego e sem custo"
-                orphan_candidate = "Sim"
-        else:
-            # IP com tráfego
-            if cost > 50:
-                removal_impact = "Alto"
-            elif cost > 10:
-                removal_impact = "Médio"
-            else:
-                removal_impact = "Baixo"
-            recommendation = "MANTER - IP em uso com tráfego detectado"
-            orphan_candidate = "Não"
-        
-        return {
-            'in_use': in_use,
-            'classification': classification,
-            'purpose': purpose,
-            'removal_impact': removal_impact,
-            'recommendation': recommendation,
-            'orphan_candidate': orphan_candidate
-        }
-    
-    # Análise padrão para outros recursos
-    in_use = "Sim" if cost > 0 else "Não"
-    
-    if "virtualmachines" in resource_type:
-        classification = "Computação - VM"
-        purpose = "Virtual Machine"
-    elif "disks" in resource_type:
-        classification = "Armazenamento - Disco"
-        purpose = "Managed Disk"
-    elif "storageaccounts" in resource_type:
-        classification = "Armazenamento - Storage"
-        purpose = "Storage Account"
-    elif "recoveryservices" in resource_type:
-        classification = "Backup - Recovery Vault"
-        purpose = "Backup Vault"
-    elif "restorepointcollections" in resource_type:
-        classification = "Backup - Pontos Restauração"
-        purpose = "Backup Collection"
-    elif "networkinterfaces" in resource_type:
-        classification = "Rede - Interface"
-        purpose = "Network Interface"
-    elif "networksecuritygroups" in resource_type:
-        classification = "Rede - Segurança"
-        purpose = "NSG"
-    elif "virtualnetworks" in resource_type:
-        classification = "Rede - Virtual"
-        purpose = "VNet"
-    elif "operationalinsights" in resource_type:
-        classification = "Monitoramento - Log Analytics"
-        purpose = "Log Analytics"
-    elif "networkwatchers" in resource_type:
-        classification = "Monitoramento - Network Watcher"
-        purpose = "Network Watcher"
-    elif "routetables" in resource_type:
-        classification = "Rede - Tabela de Rotas"
-        purpose = "Route Table"
-    elif "extensions" in resource_type:
-        classification = "Computação - Extensão"
-        purpose = "VM Extension"
-    else:
-        classification = "Outros"
-        purpose = resource_type.split('/')[-1]
-    
-    removal_impact = "Baixo"
-    if cost > 100:
-        removal_impact = "Alto"
-    elif cost > 10:
-        removal_impact = "Médio"
-    
-    recommendation = "Manter"
-    if cost == 0 and "Sem" in usage_summary:
-        recommendation = "Revisar - Sem custo"
-    
-    orphan_candidate = "Não"
-    if dependencies == "" and cost == 0:
-        orphan_candidate = "Sim"
-    
-    return {
-        'in_use': in_use,
-        'classification': classification,
-        'purpose': purpose,
-        'removal_impact': removal_impact,
-        'recommendation': recommendation,
-        'orphan_candidate': orphan_candidate
-    }
-
 # ===== FUNÇÃO PRINCIPAL =====
 def main():
+    parser = argparse.ArgumentParser(description='Azure Inventory Script - Coleta de recursos e métricas')
+    parser.add_argument('--subscription-ids', nargs='+', 
+                        help='IDs das subscriptions para análise (ex: --subscription-ids "id1" "id2")')
+    args = parser.parse_args()
+    
+    # Obter subscription IDs dos argumentos ou usar padrão
+    if args.subscription_ids:
+        subscription_ids = args.subscription_ids
+        print(f"\n📋 Usando subscriptions fornecidas: {len(subscription_ids)}")
+    else:
+        # Subscription padrão (primeira da lista)
+        default_subscriptions = ["977408fa-9ef9-4bd6-bbfd-8fb6f8cc0550"]
+        subscription_ids = default_subscriptions
+        print(f"\n📋 Nenhuma subscription fornecida. Usando subscription padrão: {default_subscriptions[0][:8]}...")
+        print("   Para especificar subscriptions, use: --subscription-ids \"id1\" \"id2\"")
+    
+    # Validar subscriptions
+    valid_ids, invalid_ids = validate_subscription_ids(subscription_ids)
+    
+    if not valid_ids:
+        print("\n❌ Nenhuma subscription válida encontrada!")
+        exit(1)
+    
+    if invalid_ids:
+        print(f"\n⚠️ {len(invalid_ids)} subscription(s) inválida(s) ignorada(s)")
+    
+    # Obter nomes das subscriptions dinamicamente
+    subscription_names = get_subscription_names(valid_ids)
+    
     print("\n" + "="*60)
-    print("🚀 AZURE INVENTORY SCRIPT - VERSÃO COMPLETA")
+    print("🚀 AZURE INVENTORY SCRIPT - VERSÃO COMPLETA (TODOS OS TIPOS)")
     print("="*60)
     
-    # 1. Buscar recursos
-    df = get_all_resources(SUBSCRIPTION_IDS)
+    print(f"\n📋 Subscriptions a serem analisadas:")
+    for sub_id in valid_ids:
+        print(f"  • {subscription_names.get(sub_id, sub_id[:8])} ({sub_id})")
+    
+    # 1. Buscar TODOS os recursos
+    df = get_all_resources(valid_ids, subscription_names)
     if df.empty:
         print("\n❌ Nenhum recurso encontrado!")
         exit(1)
@@ -590,11 +639,11 @@ def main():
     # 2. Estatísticas por tipo
     print("\n📊 Distribuição por tipo de recurso:")
     type_counts = df['resourceType'].value_counts()
-    for rt, count in type_counts.head(15).items():
+    for rt, count in type_counts.head(30).items():
         type_short = rt.split('/')[-1]
-        print(f"  • {type_short:<35} {count:>2} recursos")
+        print(f"  • {type_short:<50} {count:>3} recursos")
     
-    # 3. Resetar índice para evitar duplicatas
+    # 3. Resetar índice
     df = df.reset_index(drop=True)
     
     # 4. Adicionar colunas
@@ -614,110 +663,168 @@ def main():
     df['recommendation'] = ""
     df['orphan_candidate'] = ""
     
-    # 5. Obter SKU
-    sku_types = discover_sku_types(df)
-    print("\n🔄 OBTENDO SKU...")
-    for idx, row in df.iterrows():
-        if row['resourceType'] in sku_types:
-            df.loc[idx, 'skuName'] = get_resource_sku_dynamic(row['id'], row['resourceType'])
-    
-    # 6. Identificar dependências
+    # 5. Identificar dependências
     print("\n🔗 IDENTIFICANDO DEPENDÊNCIAS...")
     df = identify_dependencies(df)
+    
+    # 6. Obter SKU para recursos que têm SKU
+    print("\n🔄 OBTENDO SKU...")
+    sku_types = [
+        'microsoft.compute/virtualmachines',
+        'microsoft.compute/disks',
+        'microsoft.storage/storageaccounts',
+        'microsoft.network/publicipaddresses',
+        'microsoft.recoveryservices/vaults',
+        'microsoft.web/serverfarms',
+        'microsoft.containerservice/managedclusters'
+    ]
+    for idx, row in df.iterrows():
+        if idx % 20 == 0:
+            print(f"  Processando SKU: {idx + 1}/{len(df)}")
+        if row['resourceType'] in sku_types:
+            df.loc[idx, 'skuName'] = get_resource_sku_dynamic(row['id'], row['resourceType'])
     
     # 7. Coletar métricas e custos
     print("\n💰 COLETANDO MÉTRICAS E CUSTOS...")
     
-    cost_types = ['microsoft.compute/virtualmachines', 'microsoft.compute/disks',
-                  'microsoft.storage/storageaccounts', 'microsoft.network/publicipaddresses',
-                  'microsoft.recoveryservices/vaults', 'microsoft.operationalinsights/workspaces']
+    cost_success = 0
+    metric_success = 0
     
     for idx, (idx_row, row) in enumerate(df.iterrows()):
         resource_type = row['resourceType']
         resource_name = row['resourceName']
         type_short = resource_type.split('/')[-1]
         
-        print(f"\n[{idx+1}/{len(df)}] {resource_name[:45]} ({type_short})")
+        if idx % 20 == 0:
+            print(f"\nProcessando recurso {idx+1}/{len(df)}: {resource_name[:50]} ({type_short})")
         
-        # Coletar métricas
+        # Coletar métricas por tipo
         summary = ""
         try:
             if resource_type == 'microsoft.compute/virtualmachines':
-                summary = get_vm_metrics_summary(row['id'], row['skuName'])
-                print(f"   📊 VM: {summary[:80]}")
+                summary = get_vm_metrics_summary(row['id'])
+                if summary and "Sem" not in summary:
+                    metric_success += 1
             elif resource_type == 'microsoft.network/publicipaddresses':
                 summary = get_public_ip_metrics_summary(row['id'])
-                print(f"   📊 IP: {summary}")
+                metric_success += 1
             elif resource_type == 'microsoft.storage/storageaccounts':
                 summary = get_storage_metrics_summary(row['id'])
-                print(f"   📊 Storage: {summary}")
+                if summary and "Sem" not in summary:
+                    metric_success += 1
             elif resource_type == 'microsoft.compute/disks':
                 summary = get_disk_metrics_summary(row['id'])
-                print(f"   📊 Disco: {summary}")
+                if summary and "Sem" not in summary:
+                    metric_success += 1
             elif resource_type == 'microsoft.network/networkinterfaces':
                 summary = get_nic_metrics_summary(row['id'])
-                print(f"   📊 NIC: {summary}")
+                if summary and "Sem" not in summary:
+                    metric_success += 1
             elif resource_type == 'microsoft.network/networksecuritygroups':
                 summary = get_nsg_metrics_summary(row['id'])
-                print(f"   📊 NSG: {summary}")
+                if summary and "Sem" not in summary:
+                    metric_success += 1
             elif resource_type == 'microsoft.network/virtualnetworks':
                 summary = get_vnet_usage_summary(row['id'], df)
-                print(f"   📊 VNet: {summary}")
+                metric_success += 1
             elif resource_type == 'microsoft.compute/restorepointcollections':
                 summary = get_backup_metrics_summary(row['id'])
-                print(f"   📊 Backup: {summary}")
+                metric_success += 1
             elif resource_type == 'microsoft.recoveryservices/vaults':
                 summary = get_vault_metrics_summary(row['id'])
-                print(f"   📊 Vault: {summary}")
+                if summary and "Sem" not in summary:
+                    metric_success += 1
             elif resource_type == 'microsoft.operationalinsights/workspaces':
                 summary = get_log_analytics_metrics_summary(row['id'])
-                print(f"   📊 Log Analytics: {summary}")
+                if summary and "Sem" not in summary:
+                    metric_success += 1
+            elif resource_type == 'microsoft.web/sites':
+                summary = get_app_service_metrics_summary(row['id'])
+                if summary and "Sem" not in summary:
+                    metric_success += 1
+            elif resource_type == 'microsoft.sql/servers/databases':
+                summary = get_sql_db_metrics_summary(row['id'])
+                if summary and "Sem" not in summary:
+                    metric_success += 1
+            elif resource_type == 'microsoft.keyvault/vaults':
+                summary = get_keyvault_metrics_summary(row['id'])
+                if summary and "Sem" not in summary:
+                    metric_success += 1
+            elif resource_type == 'microsoft.servicebus/namespaces':
+                summary = get_servicebus_metrics_summary(row['id'])
+                if summary and "Sem" not in summary:
+                    metric_success += 1
+            elif resource_type == 'microsoft.documentdb/databaseaccounts':
+                summary = get_cosmosdb_metrics_summary(row['id'])
+                if summary and "Sem" not in summary:
+                    metric_success += 1
+            elif resource_type == 'microsoft.network/loadbalancers':
+                summary = get_loadbalancer_metrics_summary(row['id'])
+                if summary and "Sem" not in summary:
+                    metric_success += 1
+            elif resource_type == 'microsoft.logic/workflows':
+                summary = get_logicapp_metrics_summary(row['id'])
+                if summary and "Sem" not in summary:
+                    metric_success += 1
+            elif resource_type == 'microsoft.apimanagement/service':
+                summary = get_apim_metrics_summary(row['id'])
+                if summary and "Sem" not in summary:
+                    metric_success += 1
+            elif resource_type == 'microsoft.containerservice/managedclusters':
+                summary = get_aks_metrics_summary(row['id'])
+                if summary and "Sem" not in summary:
+                    metric_success += 1
             elif resource_type == 'microsoft.network/networkwatchers':
                 summary = "Monitoramento de rede ativo"
-                print(f"   📊 Network Watcher: {summary}")
+                metric_success += 1
             elif resource_type == 'microsoft.network/routetables':
                 summary = "Tabela de rotas configurada"
-                print(f"   📊 Route Table: {summary}")
+                metric_success += 1
             elif 'extensions' in resource_type:
                 summary = "Extensão de VM instalada"
-                print(f"   📊 Extension: {summary}")
+                metric_success += 1
             else:
                 summary = f"Recurso do tipo {type_short}"
-                print(f"   📊 {summary}")
         except Exception as e:
             summary = f"Erro: {str(e)[:50]}"
-            print(f"   ⚠️ {summary}")
         
-        df.loc[idx_row, 'usage_summary'] = summary if summary else "Sem métricas disponibles"
+        df.loc[idx_row, 'usage_summary'] = summary if summary else "Sem métricas disponíveis"
         
         # Coletar custo
-        if resource_type in cost_types:
-            cost = get_cost_for_resource(row['subscriptionId'], row['id'], row['resourceName'], resource_type)
-            if cost is not None:
-                df.loc[idx_row, 'cost_30d'] = round(cost, 4)
-                df.loc[idx_row, 'daily_cost_30d'] = round(cost / DAYS, 4)
-                if cost > 0:
-                    print(f"   💰 Custo: R$ {cost:.2f}")
-                else:
-                    print(f"   💰 Custo: R$ 0.00")
+        cost = get_cost_for_resource(row['subscriptionId'], row['id'], row['resourceName'], resource_type)
+        if cost is not None:
+            df.loc[idx_row, 'cost_30d'] = round(cost, 4)
+            df.loc[idx_row, 'daily_cost_30d'] = round(cost / DAYS, 4)
+            cost_success += 1
     
     # 8. Classificação
     print("\n📊 CLASSIFICANDO RECURSOS...")
     
-    classifications = []
     for idx, row in df.iterrows():
-        analysis = analyze_resource(
-            row['resourceName'],
-            row['resourceType'],
-            row['cost_30d'],
-            row.get('dependencies', ''),
-            row.get('usage_summary', ''),
-            row.get('skuName', '')
-        )
-        classifications.append(analysis)
-    
-    analysis_df = pd.DataFrame(classifications)
-    df = pd.concat([df, analysis_df], axis=1)
+        classification, purpose = classify_resource(row['resourceType'])
+        cost = row['cost_30d']
+        in_use = "Sim" if cost > 0 else "Não"
+        
+        removal_impact = "Baixo"
+        if cost > 100:
+            removal_impact = "Alto"
+        elif cost > 10:
+            removal_impact = "Médio"
+        
+        recommendation = "Manter"
+        if cost == 0:
+            recommendation = "Revisar - Sem custo"
+        
+        orphan_candidate = "Não"
+        if row.get('dependencies', '') == "" and cost == 0:
+            orphan_candidate = "Sim"
+        
+        df.loc[idx, 'in_use'] = in_use
+        df.loc[idx, 'classification'] = classification
+        df.loc[idx, 'purpose'] = purpose
+        df.loc[idx, 'removal_impact'] = removal_impact
+        df.loc[idx, 'recommendation'] = recommendation
+        df.loc[idx, 'orphan_candidate'] = orphan_candidate
     
     # 9. Salvar CSV
     required_columns = [
@@ -746,44 +853,12 @@ def main():
     for resource_type in df['resourceType'].unique():
         type_short = resource_type.split('/')[-1]
         count = len(df[df['resourceType'] == resource_type])
-        with_summary = len(df[(df['resourceType'] == resource_type) & (df['usage_summary'] != "")])
-        print(f"  • {type_short:<35} {count:>2} recursos - {with_summary:>2} com métricas")
+        with_metrics = len(df[(df['resourceType'] == resource_type) & (~df['usage_summary'].str.contains("Sem", na=False))])
+        print(f"  • {type_short:<45} {count:>3} recursos - {with_metrics:>3} com métricas")
     
-    # Estatísticas específicas para Public IPs
-    print(f"\n🌐 ANÁLISE DE IPs PÚBLICOS:")
-    
-    # Criar listas separadas para evitar problemas de pandas
-    ips_com_trafego = []
-    ips_sem_trafego = []
-    
-    for idx, row in df.iterrows():
-        if row['resourceType'] == 'microsoft.network/publicipaddresses':
-            in_use_value = row.get('in_use', 'Não')
-            # Garantir que in_use_value é string
-            if isinstance(in_use_value, str):
-                in_use_str = in_use_value
-            else:
-                in_use_str = str(in_use_value) if in_use_value is not None else 'Não'
-            
-            ip_info = {
-                'resourceName': row['resourceName'],
-                'in_use': in_use_str,
-                'cost_30d': row.get('cost_30d', 0),
-                'usage_summary': row.get('usage_summary', '')
-            }
-            
-            if in_use_str == 'Sim':
-                ips_com_trafego.append(ip_info)
-            else:
-                ips_sem_trafego.append(ip_info)
-    
-    print(f"  • IPs com tráfego: {len(ips_com_trafego)}")
-    print(f"  • IPs sem tráfego: {len(ips_sem_trafego)}")
-    
-    if ips_sem_trafego:
-        print(f"\n  🗑️ IPs candidatos à remoção:")
-        for ip in ips_sem_trafego:
-            print(f"     - {ip['resourceName']} (custo: R$ {ip['cost_30d']:.2f}) - {ip['usage_summary']}")
+    print(f"\n📈 RESUMO DA COLETA:")
+    print(f"  ✅ Custos coletados: {cost_success}/{len(df)} recursos")
+    print(f"  ✅ Métricas coletadas: {metric_success} recursos")
     
     print(f"\n💾 Arquivo salvo: {output_file}")
     print(f"\n✅ Processamento concluído!")
