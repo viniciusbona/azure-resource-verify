@@ -6652,3 +6652,4 @@ venv/lib/python3.12/site-packages/urllib3-2.6.3.dist-info/METADATA
 venv/lib/python3.12/site-packages/urllib3-2.6.3.dist-info/RECORD
 venv/lib/python3.12/site-packages/urllib3-2.6.3.dist-info/WHEEL
 venv/lib/python3.12/site-packages/urllib3-2.6.3.dist-info/licenses/LICENSE.txt
+output/azure_inventory_complete.csv
