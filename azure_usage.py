@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
 Azure Inventory Script - VERSÃO COMPLETA COM MÉTRICAS AVANÇADAS
-CORRIGIDO - Baseado na versão funcional azure_usage copy.py
-Inclui métricas detalhadas para APIM (latência, falhas, largura de banda) 
-e Backup Vault (último backup, sucesso/falha, retenção)
+CORRIGIDO - Inclui métricas para APIM, Backup Vault e VPN Gateway
 """
 
 import os
@@ -30,10 +28,14 @@ DELAY_BETWEEN_REQUESTS = 2
 ENABLE_METRICS = True
 MAX_RETRIES = 3
 
-# ===== SUBSCRIPTIONS PADRÃO (copiado da versão funcional) =====
+# ===== SUBSCRIPTIONS PADRÃO =====
 DEFAULT_SUBSCRIPTION_IDS = ["d1fe8d89-6fb0-489e-816a-7e9aa0d666aa", "fb61a2b6-5478-488a-a5e6-d123b28d30d9"]
 
 os.makedirs(OUT_DIR, exist_ok=True)
+
+# Variáveis globais para período
+START_DATE = None
+END_DATE = None
 
 # ===== MAPEAMENTO DE SKU PARA CUSTOS ESTIMADOS =====
 SKU_COST_MAP = {
@@ -106,171 +108,6 @@ def validate_subscription_ids(subscription_ids):
             print(f"   - {inv_id}")
     return valid_ids, invalid_ids
 
-# ===== MÉTRICAS AVANÇADAS PARA API MANAGEMENT =====
-def get_apim_metrics_enhanced(resource_id: str) -> str:
-    """
-    Retorna métricas detalhadas do API Management:
-    - Total de requisições
-    - Requisições com sucesso (2xx)
-    - Requisições com erro (4xx, 5xx)
-    - Latência média
-    - Largura de banda (dados transferidos)
-    - Capacidade do gateway
-    """
-    summary_parts = []
-    
-    # Métricas básicas
-    requests = get_metrics_with_retry(resource_id, "Requests", "Total", DAYS)
-    if requests is not None and requests > 0:
-        summary_parts.append(f"Total Req: {format_number(requests)}")
-    
-    # Requisições com sucesso (códigos 2xx)
-    success_requests = get_metrics_with_retry(resource_id, "SuccessfulRequests", "Total", DAYS)
-    if success_requests is not None and success_requests > 0:
-        success_rate = (success_requests / requests * 100) if requests and requests > 0 else 0
-        summary_parts.append(f"Sucesso: {format_number(success_requests)} ({success_rate:.1f}%)")
-    
-    # Requisições com erro (códigos 4xx)
-    failed_requests = get_metrics_with_retry(resource_id, "FailedRequests", "Total", DAYS)
-    if failed_requests is not None and failed_requests > 0:
-        failed_rate = (failed_requests / requests * 100) if requests and requests > 0 else 0
-        summary_parts.append(f"Falhas 4xx: {format_number(failed_requests)} ({failed_rate:.1f}%)")
-    
-    # Erros 5xx
-    backend_errors = get_metrics_with_retry(resource_id, "BackendErrors", "Total", DAYS)
-    if backend_errors is not None and backend_errors > 0:
-        summary_parts.append(f"Erros 5xx: {format_number(backend_errors)}")
-    
-    # Latência média
-    duration = get_metrics_with_retry(resource_id, "Duration", "Average", DAYS)
-    if duration is not None and duration > 0:
-        summary_parts.append(f"Latência: {duration:.0f}ms")
-    
-    # Largura de banda (dados enviados)
-    egress_bandwidth = get_metrics_with_retry(resource_id, "Egress", "Total", DAYS)
-    if egress_bandwidth is not None and egress_bandwidth > 0:
-        egress_mb = egress_bandwidth / (1024 * 1024)
-        if egress_mb >= 1024:
-            summary_parts.append(f"Download: {egress_mb/1024:.1f} GB")
-        else:
-            summary_parts.append(f"Download: {egress_mb:.1f} MB")
-    
-    # Capacidade do gateway
-    capacity = get_metrics_with_retry(resource_id, "Capacity", "Average", DAYS)
-    if capacity is not None and capacity > 0:
-        summary_parts.append(f"Capacidade: {capacity:.0f}%")
-    
-    return "; ".join(summary_parts) if summary_parts else "Sem métricas"
-
-# ===== MÉTRICAS AVANÇADAS PARA BACKUP VAULT =====
-def get_backup_vault_metrics_enhanced(resource_id: str) -> str:
-    """
-    Retorna métricas detalhadas do Recovery Services Vault
-    """
-    summary_parts = []
-    vault_name = resource_id.split('/')[-1]
-    resource_group = resource_id.split('/')[4]
-    
-    # Número de itens em backup
-    backup_items = get_metrics_with_retry(resource_id, "Backup Items", "Average", DAYS)
-    if backup_items is not None and backup_items > 0:
-        summary_parts.append(f"Itens: {backup_items:.0f}")
-    
-    # Tamanho total dos backups
-    backup_storage = get_metrics_with_retry(resource_id, "Backup Storage", "Total", DAYS)
-    if backup_storage is not None and backup_storage > 0:
-        storage_gb = backup_storage / (1024 * 1024 * 1024)
-        summary_parts.append(f"Storage: {storage_gb:.1f} GB")
-    
-    # Tenta obter informações dos itens de backup via CLI
-    try:
-        cmd = [
-            "az", "backup", "item", "list",
-            "--vault-name", vault_name,
-            "--resource-group", resource_group,
-            "--output", "json"
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        
-        if result.returncode == 0:
-            items = json.loads(result.stdout)
-            
-            if items:
-                vm_count = sum(1 for i in items if i.get('properties', {}).get('workloadType') == 'VM')
-                sql_count = sum(1 for i in items if i.get('properties', {}).get('workloadType') == 'SQLDataBase')
-                
-                if vm_count > 0:
-                    summary_parts.append(f"VMs: {vm_count}")
-                if sql_count > 0:
-                    summary_parts.append(f"SQL: {sql_count}")
-                
-                # Verifica o último backup
-                last_backup_dates = []
-                for item in items[:5]:
-                    item_name = item.get('name', '')
-                    if item_name:
-                        cmd_job = [
-                            "az", "backup", "job", "list",
-                            "--vault-name", vault_name,
-                            "--resource-group", resource_group,
-                            "--query", f"[?properties.entityFriendlyName=='{item_name}']",
-                            "--output", "json"
-                        ]
-                        job_result = subprocess.run(cmd_job, capture_output=True, text=True, timeout=30)
-                        
-                        if job_result.returncode == 0:
-                            jobs = json.loads(job_result.stdout)
-                            if jobs:
-                                latest_job = jobs[0]
-                                job_status = latest_job.get('properties', {}).get('status', '')
-                                end_time = latest_job.get('properties', {}).get('endTime', '')
-                                
-                                if end_time and job_status == 'Completed':
-                                    try:
-                                        end_date = parser.parse(end_time)
-                                        days_ago = (datetime.now(timezone.utc) - end_date).days
-                                        last_backup_dates.append(days_ago)
-                                    except:
-                                        pass
-                
-                if last_backup_dates:
-                    last_backup_days = min(last_backup_dates)
-                    if last_backup_days <= 1:
-                        summary_parts.append("Backup: hoje")
-                    elif last_backup_days <= 7:
-                        summary_parts.append(f"Backup: há {last_backup_days} dias")
-                    else:
-                        summary_parts.append(f"Backup: há {last_backup_days} dias ⚠️")
-    
-    except Exception as e:
-        pass
-    
-    # Tenta verificar o status geral do vault
-    try:
-        cmd_policy = [
-            "az", "backup", "policy", "list",
-            "--vault-name", vault_name,
-            "--resource-group", resource_group,
-            "--output", "json"
-        ]
-        policy_result = subprocess.run(cmd_policy, capture_output=True, text=True, timeout=30)
-        
-        if policy_result.returncode == 0:
-            policies = json.loads(policy_result.stdout)
-            if policies:
-                for policy in policies[:2]:
-                    retention = policy.get('properties', {}).get('retentionPolicy', {})
-                    daily_retention = retention.get('dailySchedule', {}).get('retentionDuration', {})
-                    retention_days = daily_retention.get('count', 0)
-                    
-                    if retention_days > 0:
-                        summary_parts.append(f"Retenção: {retention_days} dias")
-                        break
-    except:
-        pass
-    
-    return "; ".join(summary_parts) if summary_parts else "Sem métricas de backup"
-
 # ===== FUNÇÃO PARA MÉTRICAS COM RETRY =====
 def get_metrics_with_retry(resource_id: str, metric_name: str, aggregation: str, days: int, max_retries: int = MAX_RETRIES) -> Optional[float]:
     """Obtém métricas com retry automático"""
@@ -323,16 +160,220 @@ def get_metrics_via_cli(resource_id: str, metric_name: str, aggregation: str, da
     except Exception:
         return None
 
+# ===== MÉTRICAS AVANÇADAS PARA API MANAGEMENT =====
+def get_apim_metrics_enhanced(resource_id: str) -> str:
+    """Retorna métricas detalhadas do API Management"""
+    summary_parts = []
+    
+    requests = get_metrics_with_retry(resource_id, "Requests", "Total", DAYS)
+    if requests is not None and requests > 0:
+        summary_parts.append(f"Total Req: {format_number(requests)}")
+    
+    success_requests = get_metrics_with_retry(resource_id, "SuccessfulRequests", "Total", DAYS)
+    if success_requests is not None and success_requests > 0:
+        success_rate = (success_requests / requests * 100) if requests and requests > 0 else 0
+        summary_parts.append(f"Sucesso: {format_number(success_requests)} ({success_rate:.1f}%)")
+    
+    failed_requests = get_metrics_with_retry(resource_id, "FailedRequests", "Total", DAYS)
+    if failed_requests is not None and failed_requests > 0:
+        failed_rate = (failed_requests / requests * 100) if requests and requests > 0 else 0
+        summary_parts.append(f"Falhas 4xx: {format_number(failed_requests)} ({failed_rate:.1f}%)")
+    
+    backend_errors = get_metrics_with_retry(resource_id, "BackendErrors", "Total", DAYS)
+    if backend_errors is not None and backend_errors > 0:
+        summary_parts.append(f"Erros 5xx: {format_number(backend_errors)}")
+    
+    duration = get_metrics_with_retry(resource_id, "Duration", "Average", DAYS)
+    if duration is not None and duration > 0:
+        summary_parts.append(f"Latência: {duration:.0f}ms")
+    
+    egress_bandwidth = get_metrics_with_retry(resource_id, "Egress", "Total", DAYS)
+    if egress_bandwidth is not None and egress_bandwidth > 0:
+        egress_mb = egress_bandwidth / (1024 * 1024)
+        if egress_mb >= 1024:
+            summary_parts.append(f"Download: {egress_mb/1024:.1f} GB")
+        else:
+            summary_parts.append(f"Download: {egress_mb:.1f} MB")
+    
+    capacity = get_metrics_with_retry(resource_id, "Capacity", "Average", DAYS)
+    if capacity is not None and capacity > 0:
+        summary_parts.append(f"Capacidade: {capacity:.0f}%")
+    
+    return "; ".join(summary_parts) if summary_parts else "Sem métricas"
+
+# ===== MÉTRICAS AVANÇADAS PARA BACKUP VAULT =====
+def get_backup_vault_metrics_enhanced(resource_id: str) -> str:
+    """Retorna métricas detalhadas do Recovery Services Vault"""
+    summary_parts = []
+    vault_name = resource_id.split('/')[-1]
+    resource_group = resource_id.split('/')[4]
+    
+    backup_items = get_metrics_with_retry(resource_id, "Backup Items", "Average", DAYS)
+    if backup_items is not None and backup_items > 0:
+        summary_parts.append(f"Itens: {backup_items:.0f}")
+    
+    backup_storage = get_metrics_with_retry(resource_id, "Backup Storage", "Total", DAYS)
+    if backup_storage is not None and backup_storage > 0:
+        storage_gb = backup_storage / (1024 * 1024 * 1024)
+        summary_parts.append(f"Storage: {storage_gb:.1f} GB")
+    
+    try:
+        cmd = [
+            "az", "backup", "item", "list",
+            "--vault-name", vault_name,
+            "--resource-group", resource_group,
+            "--output", "json"
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        
+        if result.returncode == 0:
+            items = json.loads(result.stdout)
+            if items:
+                vm_count = sum(1 for i in items if i.get('properties', {}).get('workloadType') == 'VM')
+                sql_count = sum(1 for i in items if i.get('properties', {}).get('workloadType') == 'SQLDataBase')
+                
+                if vm_count > 0:
+                    summary_parts.append(f"VMs: {vm_count}")
+                if sql_count > 0:
+                    summary_parts.append(f"SQL: {sql_count}")
+                
+                last_backup_dates = []
+                for item in items[:5]:
+                    item_name = item.get('name', '')
+                    if item_name:
+                        cmd_job = [
+                            "az", "backup", "job", "list",
+                            "--vault-name", vault_name,
+                            "--resource-group", resource_group,
+                            "--query", f"[?properties.entityFriendlyName=='{item_name}']",
+                            "--output", "json"
+                        ]
+                        job_result = subprocess.run(cmd_job, capture_output=True, text=True, timeout=30)
+                        
+                        if job_result.returncode == 0:
+                            jobs = json.loads(job_result.stdout)
+                            if jobs:
+                                latest_job = jobs[0]
+                                job_status = latest_job.get('properties', {}).get('status', '')
+                                end_time = latest_job.get('properties', {}).get('endTime', '')
+                                
+                                if end_time and job_status == 'Completed':
+                                    try:
+                                        end_date = parser.parse(end_time)
+                                        days_ago = (datetime.now(timezone.utc) - end_date).days
+                                        last_backup_dates.append(days_ago)
+                                    except:
+                                        pass
+                
+                if last_backup_dates:
+                    last_backup_days = min(last_backup_dates)
+                    if last_backup_days <= 1:
+                        summary_parts.append("Backup: hoje")
+                    elif last_backup_days <= 7:
+                        summary_parts.append(f"Backup: há {last_backup_days} dias")
+                    else:
+                        summary_parts.append(f"Backup: há {last_backup_days} dias ⚠️")
+    
+    except Exception:
+        pass
+    
+    try:
+        cmd_policy = [
+            "az", "backup", "policy", "list",
+            "--vault-name", vault_name,
+            "--resource-group", resource_group,
+            "--output", "json"
+        ]
+        policy_result = subprocess.run(cmd_policy, capture_output=True, text=True, timeout=30)
+        
+        if policy_result.returncode == 0:
+            policies = json.loads(policy_result.stdout)
+            if policies:
+                for policy in policies[:2]:
+                    retention = policy.get('properties', {}).get('retentionPolicy', {})
+                    daily_retention = retention.get('dailySchedule', {}).get('retentionDuration', {})
+                    retention_days = daily_retention.get('count', 0)
+                    
+                    if retention_days > 0:
+                        summary_parts.append(f"Retenção: {retention_days} dias")
+                        break
+    except:
+        pass
+    
+    return "; ".join(summary_parts) if summary_parts else "Sem métricas de backup"
+
+# ===== MÉTRICAS ESPECÍFICAS PARA VPN GATEWAY =====
+def get_vpn_gateway_metrics_enhanced(resource_id: str) -> str:
+    """Retorna métricas detalhadas do VPN Gateway"""
+    summary_parts = []
+    gateway_name = resource_id.split('/')[-1]
+    resource_group = resource_id.split('/')[4]
+    
+    try:
+        cmd = [
+            "az", "network", "vpn-gateway", "show",
+            "--ids", resource_id,
+            "--query", "provisioningState",
+            "--output", "tsv"
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0 and result.stdout.strip():
+            status = result.stdout.strip()
+            if status == 'Succeeded':
+                summary_parts.append("Status: Ativo")
+            else:
+                summary_parts.append(f"Status: {status}")
+    except:
+        pass
+    
+    egress_bytes = get_metrics_with_retry(resource_id, "TunnelEgressBytes", "Total", DAYS)
+    if egress_bytes is not None and egress_bytes > 0:
+        egress_gb = egress_bytes / (1024 * 1024 * 1024)
+        summary_parts.append(f"Enviado: {egress_gb:.1f} GB")
+    
+    ingress_bytes = get_metrics_with_retry(resource_id, "TunnelIngressBytes", "Total", DAYS)
+    if ingress_bytes is not None and ingress_bytes > 0:
+        ingress_gb = ingress_bytes / (1024 * 1024 * 1024)
+        summary_parts.append(f"Recebido: {ingress_gb:.1f} GB")
+    
+    avg_bandwidth = get_metrics_with_retry(resource_id, "TunnelAverageBandwidth", "Average", DAYS)
+    if avg_bandwidth is not None and avg_bandwidth > 0:
+        bandwidth_mbps = avg_bandwidth * 8 / (1024 * 1024)
+        summary_parts.append(f"Banda: {bandwidth_mbps:.1f} Mbps")
+    
+    try:
+        cmd = [
+            "az", "network", "vpn-connection", "list",
+            "--resource-group", resource_group,
+            "--vpn-gateway", gateway_name,
+            "--query", "[].{name:name, connectionStatus:connectionStatus}",
+            "--output", "json"
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        
+        if result.returncode == 0:
+            connections = json.loads(result.stdout)
+            if connections:
+                active_tunnels = sum(1 for c in connections if c.get('connectionStatus') == 'Connected')
+                total_tunnels = len(connections)
+                if active_tunnels > 0:
+                    summary_parts.append(f"Túneis: {active_tunnels}/{total_tunnels} ativos")
+    except:
+        pass
+    
+    return "; ".join(summary_parts) if summary_parts else "Sem métricas (gateway pode estar parado)"
+
 # ===== FUNÇÃO MELHORADA PARA OBTER CUSTO =====
 def get_cost_for_resource_enhanced(subscription_id: str, resource_id: str, resource_name: str, 
-                                   resource_type: str, sku_name: str, token: str) -> Tuple[float, str]:
+                                   resource_type: str, sku_name: str, token: str, 
+                                   start_date: datetime, end_date: datetime) -> Tuple[float, str]:
     """Versão melhorada para obter custo do recurso com fallback"""
     warning_msg = ""
     
     # Tenta Cost Management API
     url = f"https://management.azure.com/subscriptions/{subscription_id}/providers/Microsoft.CostManagement/query?api-version=2021-10-01"
-    start_str = start.strftime("%Y-%m-%d")
-    end_str = end.strftime("%Y-%m-%d")
+    start_str = start_date.strftime("%Y-%m-%d")
+    end_str = end_date.strftime("%Y-%m-%d")
     body = {
         "type": "ActualCost",
         "timeframe": "Custom",
@@ -392,6 +433,8 @@ def get_resource_sku_dynamic(resource_id: str, resource_type: str) -> str:
             cmd = ["az", "aks", "show", "--ids", resource_id, "--query", "sku.tier", "--output", "tsv"]
         elif resource_type == 'microsoft.apimanagement/service':
             cmd = ["az", "apim", "show", "--ids", resource_id, "--query", "sku.name", "--output", "tsv"]
+        elif resource_type == 'microsoft.network/virtualnetworkgateways':
+            cmd = ["az", "network", "vpn-gateway", "show", "--ids", resource_id, "--query", "sku.name", "--output", "tsv"]
         else:
             cmd = ["az", "resource", "show", "--ids", resource_id, "--query", "sku.name", "--output", "tsv"]
         
@@ -466,6 +509,8 @@ def classify_resource(resource_type: str) -> Tuple[str, str]:
         'servicebus': ("Integração - Service Bus", "Service Bus"),
         'documentdb': ("Banco de Dados - Cosmos DB", "Cosmos DB"),
         'containerservice': ("Contêiner - Kubernetes", "AKS"),
+        'workflows': ("Integração - Logic App", "Logic App"),
+        'connections': ("Integração - Connection", "API Connection"),
     }
     for key, value in type_map.items():
         if key in type_lower:
@@ -518,6 +563,8 @@ def identify_dependencies(df: pd.DataFrame) -> pd.DataFrame:
 
 # ===== FUNÇÃO PRINCIPAL =====
 def main():
+    global START_DATE, END_DATE
+    
     parser = argparse.ArgumentParser(description='Azure Inventory Script - Métricas Avançadas')
     parser.add_argument('--subscription-ids', nargs='+', 
                         help='IDs das subscriptions para análise')
@@ -563,9 +610,10 @@ def main():
         print(f"❌ Erro ao obter token: {e}")
         exit(1)
     
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=DAYS)
-    print(f"Período análise: {start.date()} → {end.date()}")
+    # Definir período
+    END_DATE = datetime.now(timezone.utc)
+    START_DATE = END_DATE - timedelta(days=DAYS)
+    print(f"Período análise: {START_DATE.date()} → {END_DATE.date()}")
     
     # Buscar recursos
     df = get_all_resources(valid_ids, arg_client)
@@ -615,7 +663,8 @@ def main():
         'microsoft.network/publicipaddresses',
         'microsoft.recoveryservices/vaults',
         'microsoft.web/serverfarms',
-        'microsoft.apimanagement/service'
+        'microsoft.apimanagement/service',
+        'microsoft.network/virtualnetworkgateways'
     ]
     
     print("\n🔄 OBTENDO SKU...")
@@ -651,6 +700,11 @@ def main():
                 if summary and "Sem" not in summary:
                     metric_success += 1
                 print(f"   📊 Backup Vault: {summary[:100]}")
+            elif resource_type == 'microsoft.network/virtualnetworkgateways':
+                summary = get_vpn_gateway_metrics_enhanced(row['id'])
+                if summary and "Sem" not in summary:
+                    metric_success += 1
+                print(f"   📊 VPN Gateway: {summary[:100]}")
             else:
                 summary = f"Recurso do tipo {type_short}"
                 print(f"   📊 {summary[:100]}")
@@ -663,7 +717,7 @@ def main():
         # Coletar custo
         cost, warning = get_cost_for_resource_enhanced(
             row['subscriptionId'], row['id'], row['resourceName'], 
-            resource_type, df.loc[idx, 'skuName'], token
+            resource_type, df.loc[idx, 'skuName'], token, START_DATE, END_DATE
         )
         df.loc[idx, 'cost_30d'] = round(cost, 4)
         df.loc[idx, 'daily_cost_30d'] = round(cost / DAYS, 4) if cost > 0 else 0
