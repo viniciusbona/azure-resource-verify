@@ -11,15 +11,11 @@ import requests
 import pandas as pd
 import subprocess
 import time
-import re
 import argparse
-import csv
 import io
 import zipfile
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, Tuple
-from urllib.parse import urlparse
-import tempfile
 
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.resourcegraph import ResourceGraphClient
@@ -31,15 +27,15 @@ OUT_DIR = "output"
 DELAY_BETWEEN_REQUESTS = 1
 ENABLE_METRICS = True
 MAX_RETRIES = 5
-POLLING_INTERVAL = 5  # segundos entre verificações de status do relatório
-MAX_POLLING_ATTEMPTS = 60  # máximo de 5 minutos de espera
+POLLING_INTERVAL = 5  # segundos entre verificações
+MAX_POLLING_ATTEMPTS = 60  # máximo de 5 minutos
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# ===== TIMESTAMP PARA O ARQUIVO DE SAÍDA =====
+# ===== TIMESTAMP =====
 FILE_TIMESTAMP = datetime.now().strftime("%d-%m-%Y-%H%M%S")
 
-# ===== LISTAS DE TIPOS DE RECURSO PARA OTIMIZAÇÃO =====
+# ===== LISTAS DE TIPOS DE RECURSO GRATUITOS =====
 COST_FREE_RESOURCE_TYPES = [
     'microsoft.network/networksecuritygroups',
     'microsoft.network/virtualnetworks',
@@ -160,7 +156,7 @@ def validate_subscription_ids(subscription_ids):
     return valid_ids, invalid_ids
 
 
-# ===== FUNÇÃO PRINCIPAL PARA OBTER CUSTOS VIA API DE DETALHES =====
+# ===== FUNÇÃO CORRIGIDA PARA OBTER CUSTOS VIA API DE DETALHES =====
 def get_cost_details_report(subscription_id: str, token: str, start_date: datetime, end_date: datetime) -> Optional[pd.DataFrame]:
     """
     Gera um relatório de custos detalhado usando a API generateCostDetailsReport
@@ -188,17 +184,19 @@ def get_cost_details_report(subscription_id: str, token: str, start_date: dateti
         response = requests.post(url, headers=headers, json=body, timeout=60)
         
         if response.status_code == 202:
+            # Extrair operation ID do header Location
             operation_location = response.headers.get('Location', '')
             if not operation_location:
                 print("   ❌ Não foi possível obter o location da operação")
                 return None
             
-            print(f"   ✅ Relatório solicitado com sucesso. Aguardando processamento...")
+            print(f"   ✅ Relatório solicitado. Operation ID: {operation_location.split('/')[-1]}")
             
             # Aguardar conclusão
             for attempt in range(MAX_POLLING_ATTEMPTS):
                 time.sleep(POLLING_INTERVAL)
                 
+                # Fazer GET na URL de status
                 status_response = requests.get(operation_location, headers=headers, timeout=30)
                 
                 if status_response.status_code == 200:
@@ -209,22 +207,33 @@ def get_cost_details_report(subscription_id: str, token: str, start_date: dateti
                     
                     if status == 'Completed':
                         # Obter link do CSV
-                        blob_link = status_data.get('manifest', {}).get('blobLink')
+                        manifest = status_data.get('manifest', {})
+                        blob_link = manifest.get('blobLink')
+                        
+                        # Também pode estar em reports[0].blobLink
+                        if not blob_link and 'reports' in manifest:
+                            reports = manifest.get('reports', [])
+                            if reports:
+                                blob_link = reports[0].get('blobLink')
+                        
                         if blob_link:
                             print(f"   ✅ Relatório gerado! Baixando arquivo...")
                             
                             # Baixar o CSV
                             csv_response = requests.get(blob_link, timeout=120)
                             if csv_response.status_code == 200:
-                                # O conteúdo pode ser ZIP ou CSV direto
                                 content = csv_response.content
                                 
                                 # Verificar se é ZIP
-                                if content[:2] == b'PK':
+                                if len(content) > 2 and content[:2] == b'PK':
                                     with zipfile.ZipFile(io.BytesIO(content)) as z:
-                                        csv_filename = [f for f in z.namelist() if f.endswith('.csv')][0]
-                                        with z.open(csv_filename) as csv_file:
-                                            df = pd.read_csv(csv_file)
+                                        csv_files = [f for f in z.namelist() if f.endswith('.csv')]
+                                        if csv_files:
+                                            with z.open(csv_files[0]) as csv_file:
+                                                df = pd.read_csv(csv_file)
+                                        else:
+                                            print("   ❌ Nenhum arquivo CSV encontrado no ZIP")
+                                            return None
                                 else:
                                     # CSV direto
                                     df = pd.read_csv(io.BytesIO(content))
@@ -234,16 +243,37 @@ def get_cost_details_report(subscription_id: str, token: str, start_date: dateti
                             else:
                                 print(f"   ❌ Erro ao baixar CSV: {csv_response.status_code}")
                                 return None
+                        else:
+                            print("   ❌ Nenhum blobLink encontrado na resposta")
+                            return None
+                            
                     elif status == 'Failed':
                         error_msg = status_data.get('error', {}).get('message', 'Erro desconhecido')
                         print(f"   ❌ Geração do relatório falhou: {error_msg}")
                         return None
                 else:
-                    print(f"   ⚠️ Erro ao verificar status: {status_response.status_code}")
+                    print(f"   ⚠️ Erro ao verificar status (HTTP {status_response.status_code}): {status_response.text[:100]}")
+                    # Se não for 200, continuar tentando (pode ser que ainda não esteja pronto)
+                    continue
             
             print(f"   ❌ Timeout aguardando geração do relatório")
             return None
             
+        elif response.status_code == 200:
+            # Resposta imediata (pode acontecer para relatórios pequenos)
+            print("   ✅ Relatório gerado imediatamente")
+            data = response.json()
+            # Processar resposta direta
+            if 'properties' in data and 'rows' in data['properties']:
+                # Formato de consulta direta
+                rows = data['properties']['rows']
+                columns = [col['name'] for col in data['properties']['columns']]
+                df = pd.DataFrame(rows, columns=columns)
+                print(f"   ✅ Relatório carregado com {len(df)} linhas")
+                return df
+            else:
+                print("   ❌ Formato de resposta não reconhecido")
+                return None
         else:
             print(f"   ❌ Erro ao solicitar relatório: {response.status_code}")
             print(f"   Resposta: {response.text[:200]}")
@@ -251,6 +281,8 @@ def get_cost_details_report(subscription_id: str, token: str, start_date: dateti
             
     except Exception as e:
         print(f"   ❌ Exceção ao obter relatório de custos: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -273,50 +305,47 @@ def get_all_costs_for_subscriptions(subscription_ids: List[str], token: str, sta
     # Consolidar todos os DataFrames
     combined_df = pd.concat(all_costs, ignore_index=True)
     
-    # Filtrar colunas relevantes e renomear
-    # As colunas podem variar, mas geralmente incluem:
-    # - ResourceId
-    # - CostInBillingCurrency
-    # - Currency
-    # - Date
+    print(f"\n📋 Colunas disponíveis no relatório de custos:")
+    for col in combined_df.columns:
+        print(f"   - {col}")
     
-    # Mapeamento de colunas comuns
-    column_mapping = {
-        'ResourceId': 'ResourceId',
-        'resourceId': 'ResourceId',
-        'CostInBillingCurrency': 'CostInBillingCurrency',
-        'costInBillingCurrency': 'CostInBillingCurrency',
-        'Currency': 'Currency',
-        'currency': 'Currency',
-        'Date': 'Date',
-        'date': 'Date'
-    }
+    # Identificar colunas de ResourceId e Cost
+    resource_id_col = None
+    cost_col = None
+    currency_col = None
     
-    # Renomear colunas para padronização
-    for old_name, new_name in column_mapping.items():
-        if old_name in combined_df.columns:
-            combined_df = combined_df.rename(columns={old_name: new_name})
+    for col in combined_df.columns:
+        col_lower = col.lower()
+        if 'resourceid' in col_lower or 'resourceid' == col_lower:
+            resource_id_col = col
+        elif 'costinbillingcurrency' in col_lower or 'cost' in col_lower:
+            cost_col = col
+        elif 'currency' in col_lower:
+            currency_col = col
     
-    # Agregar custo por ResourceId
-    if 'ResourceId' in combined_df.columns and 'CostInBillingCurrency' in combined_df.columns:
-        # Converter para numérico
-        combined_df['CostInBillingCurrency'] = pd.to_numeric(combined_df['CostInBillingCurrency'], errors='coerce')
-        
-        # Agrupar por ResourceId
-        cost_summary = combined_df.groupby('ResourceId')['CostInBillingCurrency'].sum().reset_index()
-        cost_summary.columns = ['ResourceId', 'cost_30d']
-        
-        print(f"\n💰 Total de recursos com custo identificados: {len(cost_summary)}")
-        print(f"💰 Custo total (30 dias): R$ {cost_summary['cost_30d'].sum():,.2f}")
-        
-        return cost_summary
-    else:
-        print(f"   ⚠️ Colunas esperadas não encontradas no relatório de custos")
-        print(f"   Colunas disponíveis: {list(combined_df.columns)}")
+    if resource_id_col is None or cost_col is None:
+        print(f"   ⚠️ Colunas essenciais não encontradas!")
+        print(f"   ResourceId column: {resource_id_col}")
+        print(f"   Cost column: {cost_col}")
         return pd.DataFrame()
+    
+    # Converter custo para numérico
+    combined_df[cost_col] = pd.to_numeric(combined_df[cost_col], errors='coerce')
+    
+    # Agrupar por ResourceId
+    cost_summary = combined_df.groupby(resource_id_col)[cost_col].sum().reset_index()
+    cost_summary.columns = ['ResourceId', 'cost_30d']
+    
+    # Filtrar valores nulos/zero
+    cost_summary = cost_summary[cost_summary['cost_30d'] > 0]
+    
+    print(f"\n💰 Total de recursos com custo identificado: {len(cost_summary)}")
+    print(f"💰 Custo total (30 dias): R$ {cost_summary['cost_30d'].sum():,.2f}")
+    
+    return cost_summary
 
 
-# ===== FUNÇÕES DE MÉTRICAS (mantidas do script original) =====
+# ===== FUNÇÕES DE MÉTRICAS =====
 def get_metrics_with_retry(resource_id: str, metric_name: str, aggregation: str, days: int, max_retries: int = MAX_RETRIES) -> Optional[float]:
     for attempt in range(max_retries):
         try:
@@ -374,7 +403,7 @@ def get_public_ip_metrics_enhanced(resource_id: str, resource_name: str = "") ->
         cmd = [
             "az", "network", "public-ip", "show",
             "--ids", resource_id,
-            "--query", "{sku:sku.name, ipAddress:ipAddress, associatedResource:ipConfiguration.id, provisioningState:provisioningState}",
+            "--query", "{sku:sku.name, ipAddress:ipAddress, associatedResource:ipConfiguration.id}",
             "--output", "json"
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -410,7 +439,7 @@ def get_public_ip_metrics_enhanced(resource_id: str, resource_name: str = "") ->
     elif packet_count is not None and packet_count > 0:
         summary_parts.append("✅ COM TRÁFEGO - em uso")
     
-    return "; ".join(summary_parts) if summary_parts else "Sem métricas disponíveis"
+    return "; ".join(summary_parts) if summary_parts else "Sem métricas"
 
 def get_apim_metrics_enhanced(resource_id: str) -> str:
     summary_parts = []
@@ -505,10 +534,9 @@ def get_cosmos_db_metrics_enhanced(resource_id: str) -> str:
         storage_gb = data_usage / (1024 * 1024 * 1024)
         summary_parts.append(f"Storage: {storage_gb:.1f} GB")
     
-    return "; ".join(summary_parts) if summary_parts else "Sem métricas disponíveis"
+    return "; ".join(summary_parts) if summary_parts else "Sem métricas"
 
 
-# ===== FUNÇÃO PARA OBTER SKU =====
 def get_resource_sku_dynamic(resource_id: str, resource_type: str) -> str:
     try:
         if resource_type == 'microsoft.compute/virtualmachines':
@@ -536,7 +564,6 @@ def get_resource_sku_dynamic(resource_id: str, resource_type: str) -> str:
     return ""
 
 
-# ===== FUNÇÃO PARA BUSCAR TODOS OS RECURSOS =====
 def get_all_resources(subscription_ids, arg_client):
     all_resources = []
     query = """
@@ -576,7 +603,6 @@ def get_all_resources(subscription_ids, arg_client):
     return pd.DataFrame(all_resources)
 
 
-# ===== FUNÇÃO PARA CLASSIFICAR RECURSOS =====
 def classify_resource(resource_type: str) -> Tuple[str, str]:
     type_lower = resource_type.lower()
     type_map = {
@@ -604,7 +630,6 @@ def classify_resource(resource_type: str) -> Tuple[str, str]:
     return "Outros", resource_type.split('/')[-1]
 
 
-# ===== FUNÇÃO PARA IDENTIFICAR DEPENDÊNCIAS =====
 def identify_dependencies(df: pd.DataFrame) -> pd.DataFrame:
     df['dependencies'] = ""
     df['attached_resources'] = ""
@@ -651,7 +676,6 @@ def identify_dependencies(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def is_billable_resource(resource_type: str) -> Tuple[bool, bool, str]:
-    """Determina se um recurso deve ser analisado"""
     resource_type_lower = resource_type.lower()
     
     for free in COST_FREE_RESOURCE_TYPES:
@@ -909,17 +933,6 @@ def main():
         df.loc[idx, 'removal_impact'] = removal_impact
         df.loc[idx, 'recommendation'] = recommendation
         df.loc[idx, 'orphan_candidate'] = orphan_candidate
-    
-    # Renomear colunas para compatibilidade
-    df = df.rename(columns={
-        'id': 'id',
-        'subscriptionId': 'subscriptionId',
-        'resourceName': 'resourceName',
-        'resourceType': 'resourceType',
-        'resourceGroup': 'resourceGroup',
-        'region': 'region',
-        'tags': 'tags'
-    })
     
     # Salvar CSV
     output_file = f"{OUT_DIR}/azure_inventory_advanced_{FILE_TIMESTAMP}.csv"
